@@ -10,6 +10,7 @@ from contextlib import closing
 from pathlib import Path
 
 import pytest
+import requests
 import yaml
 from jinja2.exceptions import TemplateNotFound
 
@@ -20,7 +21,7 @@ from tesseract_core.sdk.api_parse import (
     validate_tesseract_api,
 )
 from tesseract_core.sdk.cli import AVAILABLE_RECIPES
-from tesseract_core.sdk.docker_client import Container, Image, NotFound
+from tesseract_core.sdk.docker_client import APIError, Container, Image, NotFound
 from tesseract_core.sdk.exceptions import UserError
 
 
@@ -1088,13 +1089,13 @@ def test_serve_retries_on_port_in_use(mocked_docker, monkeypatch):
     seen_ports = []
     fail_times = 2  # fail the first two attempts, succeed on the third
 
-    def flaky_health(container, ping_ip, port, timeout=30):
+    def flaky_health(container, ping_ip, port, timeout):
         seen_ports.append(port)
         if len(seen_ports) <= fail_times:
-            raise engine._PortInUseError(f"Port {port} was already in use")
+            raise engine.PortInUseError(f"Port {port} was already in use")
         # success -> return normally
 
-    monkeypatch.setattr(engine, "_wait_for_health", flaky_health)
+    monkeypatch.setattr(engine, "wait_for_health", flaky_health)
 
     res, _ = engine.serve("foobar")
     assert res
@@ -1151,13 +1152,135 @@ def test_serve_reraises_non_port_container_error(mocked_docker, monkeypatch):
         engine.serve("foobar")
 
 
+# `docker inspect` state, as recorded for a container that has stopped. Verified
+# against Docker: an OOM kill reports both the flag and code 137.
+_OOM_KILLED = {"Running": False, "OOMKilled": True, "ExitCode": 137, "Error": ""}
+_EXITED = {"Running": False, "OOMKilled": False, "ExitCode": 1, "Error": ""}
+_DAEMON_ERROR = {
+    "Running": False,
+    "OOMKilled": False,
+    "ExitCode": 127,
+    "Error": 'exec: "tesseract-runtime": not found',
+}
+
+
+@pytest.mark.parametrize(
+    "state,expected",
+    [
+        (_OOM_KILLED, "exceeding its memory limit"),
+        (_DAEMON_ERROR, 'Docker reported: exec: "tesseract-runtime": not found'),
+        (_EXITED, ""),
+    ],
+)
+def test_container_diagnoses_its_own_exit(state, expected):
+    """A stopped container can say things its logs cannot -- an OOM kill writes nothing."""
+    container = Container(
+        id="abc123", short_id="abc123", name="vectoradd", attrs={"State": state}
+    )
+    assert expected in container.diagnose_exit(logs="")
+
+
+def _stopped_container(logs=b"", state=None, **overrides):
+    """A Container wired up to answer without a daemon behind it."""
+    container = Container(
+        id="abc123",
+        short_id="abc123",
+        name="vectoradd",
+        attrs={"State": state if state is not None else dict(_EXITED)},
+    )
+    container.is_running = lambda: False
+    container.wait = lambda timeout=None: {"StatusCode": 1}
+    container.logs = lambda **kwargs: logs
+    container.remove = lambda **kwargs: None
+    for name, value in overrides.items():
+        setattr(container, name, value)
+    return container
+
+
+# Nothing listens on port 1, so /health fails immediately and the wait gives up
+# on the first pass rather than sleeping.
+_DEAD = ("127.0.0.1", "1")
+
+
+def test_wait_for_health_reports_a_container_that_never_answers():
+    """A container still running when time runs out is a timeout, not a crash."""
+    container = _stopped_container(is_running=lambda: True)
+
+    with pytest.raises(TimeoutError) as excinfo:
+        serving.wait_for_health(container, *_DEAD, timeout=0.05)
+
+    message = str(excinfo.value)
+    assert "did not respond to a health check in time" in message
+    assert "increase `startup_timeout`" in message
+
+
+def test_wait_for_health_singles_out_a_port_collision():
+    """A collision is racy and retriable, so it must not look like a crash."""
+    container = _stopped_container(logs=b"Error: address already in use")
+
+    with pytest.raises(engine.PortInUseError):
+        serving.wait_for_health(container, *_DEAD, timeout=0.05)
+
+
+def test_unreadable_logs_do_not_mask_the_startup_failure():
+    """Failing to read the logs is not the failure we are trying to report."""
+
+    def cannot_read(**kwargs):
+        raise APIError("daemon went away")
+
+    container = _stopped_container()
+    container.logs = cannot_read
+
+    with pytest.raises(RuntimeError) as excinfo:
+        serving.wait_for_health(container, *_DEAD, timeout=0.05)
+
+    assert "stopped running during startup" in str(excinfo.value)
+
+
+def test_failure_to_dispose_does_not_mask_the_startup_failure():
+    """Nor is failing to remove the container."""
+
+    def cannot_remove(**kwargs):
+        raise APIError("daemon went away")
+
+    container = _stopped_container(remove=cannot_remove)
+
+    with pytest.raises(RuntimeError, match="stopped running during startup"):
+        serving.wait_for_health(container, *_DEAD, timeout=0.05)
+
+
+def test_serve_disposes_of_a_container_that_never_starts(mocked_docker, monkeypatch):
+    """A container that fails to become healthy is removed, not left lying around.
+
+    Everything it knew goes into the error before it goes, and the port-conflict
+    retry path would otherwise leave one behind per attempt.
+    """
+    torn_down = []
+
+    def unreachable(*args, **kwargs):
+        raise requests.exceptions.ConnectionError("nothing listening")
+
+    # The fixture answers /health with a 200; this container never will, and is
+    # not running, so waiting gives up on it immediately.
+    monkeypatch.setattr(serving.requests, "get", unreachable)
+    monkeypatch.setattr(Container, "is_running", lambda self: False)
+    # The fixture's container overrides `remove`, so patch the class it actually is
+    mocked_cls = type(mocked_docker.containers.run(detach=True))
+    monkeypatch.setattr(mocked_cls, "remove", lambda self, **kw: torn_down.append(kw))
+
+    with pytest.raises(RuntimeError, match="stopped running during startup"):
+        engine.serve("foobar")
+
+    assert torn_down == [{"force": True}]
+
+
 def test_serve_gives_up_after_max_port_attempts(mocked_docker, monkeypatch):
     """If every attempt loses the port race, serve raises rather than looping forever."""
 
-    def always_in_use(container, ping_ip, port, timeout=30):
-        raise engine._PortInUseError(f"Port {port} was already in use")
+    def always_in_use(container, ping_ip, port, timeout):
+        raise engine.PortInUseError(f"Port {port} was already in use")
 
-    monkeypatch.setattr(engine, "_wait_for_health", always_in_use)
+    monkeypatch.setattr(engine, "wait_for_health", always_in_use)
 
     with pytest.raises(RuntimeError, match="Failed to find a free port"):
         engine.serve("foobar")
@@ -1171,13 +1294,13 @@ def test_serve_does_not_retry_user_supplied_port(mocked_docker, monkeypatch):
     """
     attempts = []
 
-    def always_in_use(container, ping_ip, port, timeout=30):
+    def always_in_use(container, ping_ip, port, timeout):
         attempts.append(port)
-        raise engine._PortInUseError(f"Port {port} was already in use")
+        raise engine.PortInUseError(f"Port {port} was already in use")
 
-    monkeypatch.setattr(engine, "_wait_for_health", always_in_use)
+    monkeypatch.setattr(engine, "wait_for_health", always_in_use)
 
-    with pytest.raises(engine._PortInUseError):
+    with pytest.raises(engine.PortInUseError):
         engine.serve("foobar", port="12345")
 
     # Exactly one attempt, on the exact port requested.
@@ -1417,7 +1540,7 @@ def _stub_serve_docker(monkeypatch):
         return Container(id="cid", short_id="cid", name="test-container", attrs={})
 
     monkeypatch.setattr(engine.docker_client.containers, "run", fake_run)
-    monkeypatch.setattr(engine, "_wait_for_health", lambda *a, **k: None)
+    monkeypatch.setattr(engine, "wait_for_health", lambda *a, **k: None)
     monkeypatch.setattr(engine, "is_podman", lambda: False)
     return captured
 
